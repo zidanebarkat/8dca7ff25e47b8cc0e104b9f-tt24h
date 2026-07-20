@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       source_urls:
-        description: 'Source URLs (newline-separated, YouTube/Kick/Twitch/HLS). YouTube = downloaded once & looped.'
+        description: 'Source URLs (pipe-separated |, YouTube/Kick/Twitch/HLS). YouTube = downloaded & looped.'
         required: true
       tiktok_session_cookies_b64:
         description: Base64-encoded TikTok session cookies JSON (from QR auth once, lasts ~30 days)
@@ -69,7 +69,8 @@ jobs:
         run: |
           mkdir -p videos
           IDX=0
-          while IFS= read -r url; do
+          IFS='|' read -ra URLS <<< "${{ inputs.source_urls }}"
+          for url in "${URLS[@]}"; do
             [ -z "$url" ] && continue
             url=$(echo "$url" | xargs)
             if echo "$url" | grep -qiE 'youtube\.com|youtu\.be'; then
@@ -94,7 +95,7 @@ jobs:
               echo "=== Non-YouTube URL, saving as-is: $url ==="
               echo "$url" > "videos/live_source.txt"
             fi
-          done <<< "${{ inputs.source_urls }}"
+          done
           echo "Downloaded $IDX videos"
           ls -lh videos/ || true
 
