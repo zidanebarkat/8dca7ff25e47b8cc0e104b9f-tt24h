@@ -2,8 +2,8 @@ name: TikTok 24/7 Stream
 on:
   workflow_dispatch:
     inputs:
-      source_url:
-        description: Source URL (YouTube/Kick/Twitch/HLS)
+      source_urls:
+        description: 'Source URLs (newline-separated, YouTube/Kick/Twitch/HLS). YouTube = downloaded once & looped.'
         required: true
       tiktok_session_cookies_b64:
         description: Base64-encoded TikTok session cookies JSON (from QR auth once, lasts ~30 days)
@@ -27,10 +27,6 @@ on:
         description: Game tag ID (e.g. 102=Free Fire, 0=none)
         required: false
         default: '0'
-      cookies_b64:
-        description: Base64-encoded YouTube cookies (for YouTube sources only)
-        required: false
-        default: ''
 
 jobs:
   stream:
@@ -44,17 +40,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-dejavu-core curl
           pip install -q yt-dlp curl_cffi
-
-      - name: Setup YouTube cookies
-        run: |
-          RAW="${{ inputs.cookies_b64 }}"
-          if [ -n "$RAW" ]; then
-            echo "$RAW" | base64 -d > cookies.txt
-            echo "COOKIES=--cookies cookies.txt" >> $GITHUB_ENV
-            echo "YouTube cookies loaded"
-          else
-            echo "COOKIES=" >> $GITHUB_ENV
-          fi
 
       - name: Save TikTok session cookies
         run: |
@@ -80,22 +65,59 @@ jobs:
           print(f'share_url={d[\"share_url\"]}')
           " >> "$GITHUB_OUTPUT"
 
-      - name: Resolve source HLS
-        id: resolve
+      - name: Download YouTube videos
         run: |
-          url="${{ inputs.source_url }}"
-          if echo "$url" | grep -qiE '\.(m3u8)($|\?)'; then
-            echo "hls=$url" >> "$GITHUB_OUTPUT"
-            echo "live=true" >> "$GITHUB_OUTPUT"
-          else
-            hls=$(yt-dlp --impersonate chrome --remote-components ejs:github --extractor-args "youtube:player_client=web" $COOKIES -f "bestvideo[height<=1080]+bestaudio/best" -g --socket-timeout 30 "$url" 2>/dev/null | tail -1) || true
-            if [ -z "$hls" ]; then
-              echo "live=false" >> "$GITHUB_OUTPUT"
-              echo "Source not live"
-              exit 1
+          mkdir -p videos
+          IDX=0
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            url=$(echo "$url" | xargs)
+            if echo "$url" | grep -qiE 'youtube\.com|youtu\.be'; then
+              echo "=== Downloading video $IDX: $url ==="
+              yt-dlp --impersonate chrome --remote-components ejs:github \
+                --extractor-args "youtube:player_client=web" \
+                -f "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" \
+                --merge-output-format mp4 \
+                -o "videos/video_$(printf '%02d' $IDX).mp4" \
+                --socket-timeout 30 --retries 3 \
+                "$url" 2>&1 || {
+                  echo "Download failed for $url, trying without format filter..."
+                  yt-dlp --impersonate chrome --remote-components ejs:github \
+                    -f "best[height<=1080]" \
+                    --merge-output-format mp4 \
+                    -o "videos/video_$(printf '%02d' $IDX).mp4" \
+                    --socket-timeout 30 --retries 3 \
+                    "$url" 2>&1
+                }
+              IDX=$((IDX + 1))
+            else
+              echo "=== Non-YouTube URL, saving as-is: $url ==="
+              echo "$url" > "videos/live_source.txt"
             fi
-            echo "hls=$hls" >> "$GITHUB_OUTPUT"
-            echo "live=true" >> "$GITHUB_OUTPUT"
+          done <<< "${{ inputs.source_urls }}"
+          echo "Downloaded $IDX videos"
+          ls -lh videos/ || true
+
+      - name: Build concat list
+        id: concat
+        run: |
+          if ls videos/video_*.mp4 1>/dev/null 2>&1; then
+            > concat.txt
+            for f in $(ls videos/video_*.mp4 | sort); do
+              echo "file '$f'" >> concat.txt
+            done
+            echo "type=video" >> "$GITHUB_OUTPUT"
+            echo "Files in concat list:"
+            cat concat.txt
+            echo "Total size:"
+            du -sh videos/
+          elif [ -f videos/live_source.txt ]; then
+            HLS=$(cat videos/live_source.txt)
+            echo "type=live" >> "$GITHUB_OUTPUT"
+            echo "hls=$HLS" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: No valid source found"
+            exit 1
           fi
 
       - name: Schedule self-reboot
@@ -109,14 +131,13 @@ jobs:
               -d '{
                 "ref": "main",
                 "inputs": {
-                  "source_url": "${{ inputs.source_url }}",
+                  "source_urls": "${{ inputs.source_urls }}",
                   "tiktok_session_cookies_b64": "${{ inputs.tiktok_session_cookies_b64 }}",
                   "github_token": "${{ inputs.github_token }}",
                   "overlay_text": "${{ inputs.overlay_text }}",
                   "title": "${{ inputs.title }}",
                   "topic": "${{ inputs.topic }}",
-                  "game_tag": "${{ inputs.game_tag }}",
-                  "cookies_b64": "${{ inputs.cookies_b64 }}"
+                  "game_tag": "${{ inputs.game_tag }}"
                 }
               }')
             if echo "$RESP" | grep -q '"id"'; then
@@ -126,13 +147,31 @@ jobs:
             sleep 30
           done) &
 
-      - name: Stream to TikTok
-        if: steps.resolve.outputs.live == 'true'
+      - name: Stream downloaded videos (loop forever)
+        if: steps.concat.outputs.type == 'video'
         env:
           OT: ${{ inputs.overlay_text }}
           RTMP_URL: ${{ steps.genkey.outputs.rtmp_url }}
         run: |
-          HLS="${{ steps.resolve.outputs.hls }}"
+          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          echo "$OT" > overlay.txt
+          BEVELED="drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x1a0b2e:x=(w-text_w)/2+5:y=(h-text_h)/2+5,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x3a1f5e:x=(w-text_w)/2+3:y=(h-text_h)/2+3,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x6b3f96:x=(w-text_w)/2+1:y=(h-text_h)/2+1,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0xC9A2FF:box=1:boxcolor=0x0a0512@0.6:boxborderw=26:bordercolor=0x1a0b2e:borderw=2:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.85:shadowx=6:shadowy=6"
+          VF="[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[main]format=yuv420p[out]"
+          for attempt in $(seq 1 50); do
+            echo "=== Stream attempt $attempt at $(date) ==="
+            ffmpeg -nostdin -re -stream_loop -1 -f concat -safe 0 -i concat.txt -filter_complex "$VF" -map '[out]' -map 0:a -c:v libx264 -preset fast -r 30 -b:v 8000k -maxrate 8000k -bufsize 16000k -g 90 -x264-params "keyint=90:min-keyint=90:level=4.1" -pix_fmt yuv420p -c:a aac -b:a 192k -flush_packets 1 -max_muxing_queue_size 2048 -f flv "$RTMP_URL" && break
+            EXIT_CODE=$?
+            echo "ffmpeg exited with code $EXIT_CODE, restarting in $((attempt * 2))s..."
+            sleep $((attempt * 2 > 30 ? 30 : attempt * 2))
+          done
+
+      - name: Stream live source
+        if: steps.concat.outputs.type == 'live'
+        env:
+          OT: ${{ inputs.overlay_text }}
+          RTMP_URL: ${{ steps.genkey.outputs.rtmp_url }}
+        run: |
+          HLS="${{ steps.concat.outputs.hls }}"
           PWL="file,http,https,tcp,tls,crypto,srt,rtmp,rtmps"
           FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
           echo "$OT" > overlay.txt
