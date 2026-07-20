@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-dejavu-core curl
-          pip install -q yt-dlp curl_cffi
+          pip install --break-system-packages -q yt-dlp curl_cffi
 
       - name: Save TikTok session cookies
         run: |

@@ -1,0 +1,8 @@
+__pycache__/
+tiktok_cookies.json
+cookies_b64.txt
+videos/
+concat.txt
+overlay.txt
+stream_key.json
+qrcode.png
