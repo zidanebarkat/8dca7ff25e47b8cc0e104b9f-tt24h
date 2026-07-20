@@ -1,0 +1,147 @@
+name: TikTok 24/7 Stream
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: Source URL (YouTube/Kick/Twitch/HLS)
+        required: true
+      tiktok_session_cookies_b64:
+        description: Base64-encoded TikTok session cookies JSON (from QR auth once, lasts ~30 days)
+        required: true
+      github_token:
+        description: GitHub PAT with workflow scope (for self-reboot)
+        required: true
+      overlay_text:
+        description: Overlay text on video
+        required: false
+        default: ''
+      title:
+        description: Stream title on TikTok
+        required: false
+        default: 'Live Stream'
+      topic:
+        description: Topic ID (5=Gaming, 6=Music, 42=Chat)
+        required: false
+        default: '5'
+      game_tag:
+        description: Game tag ID (e.g. 102=Free Fire, 0=none)
+        required: false
+        default: '0'
+      cookies_b64:
+        description: Base64-encoded YouTube cookies (for YouTube sources only)
+        required: false
+        default: ''
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-dejavu-core curl
+          pip install -q yt-dlp curl_cffi
+
+      - name: Setup YouTube cookies
+        run: |
+          RAW="${{ inputs.cookies_b64 }}"
+          if [ -n "$RAW" ]; then
+            echo "$RAW" | base64 -d > cookies.txt
+            echo "COOKIES=--cookies cookies.txt" >> $GITHUB_ENV
+            echo "YouTube cookies loaded"
+          else
+            echo "COOKIES=" >> $GITHUB_ENV
+          fi
+
+      - name: Save TikTok session cookies
+        run: |
+          echo "${{ inputs.tiktok_session_cookies_b64 }}" | base64 -d > tiktok_cookies.json
+          echo "TikTok cookies loaded ($(wc -c < tiktok_cookies.json) bytes)"
+
+      - name: Generate TikTok stream key
+        id: genkey
+        run: |
+          RESULT=$(python3 live.py \
+            --session-cookies tiktok_cookies.json \
+            --json-output \
+            --title "${{ inputs.title }}" \
+            --topic "${{ inputs.topic }}" \
+            --game "${{ inputs.game_tag }}" 2>/dev/null)
+          echo "$RESULT" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          if 'error' in d:
+              print(f'ERROR: {d[\"error\"]}', file=sys.stderr)
+              sys.exit(1)
+          print(f'rtmp_url={d[\"rtmp_url\"]}')
+          print(f'share_url={d[\"share_url\"]}')
+          " >> "$GITHUB_OUTPUT"
+
+      - name: Resolve source HLS
+        id: resolve
+        run: |
+          url="${{ inputs.source_url }}"
+          if echo "$url" | grep -qiE '\.(m3u8)($|\?)'; then
+            echo "hls=$url" >> "$GITHUB_OUTPUT"
+            echo "live=true" >> "$GITHUB_OUTPUT"
+          else
+            hls=$(yt-dlp --impersonate chrome --remote-components ejs:github --extractor-args "youtube:player_client=web" $COOKIES -f "bestvideo[height<=1080]+bestaudio/best" -g --socket-timeout 30 "$url" 2>/dev/null | tail -1) || true
+            if [ -z "$hls" ]; then
+              echo "live=false" >> "$GITHUB_OUTPUT"
+              echo "Source not live"
+              exit 1
+            fi
+            echo "hls=$hls" >> "$GITHUB_OUTPUT"
+            echo "live=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Schedule self-reboot
+        if: inputs.github_token != ''
+        run: |
+          (sleep 19800 && for i in 1 2 3; do
+            RESP=$(curl -s -X POST \
+              -H "Authorization: Bearer ${{ inputs.github_token }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/stream.yml/dispatches" \
+              -d '{
+                "ref": "main",
+                "inputs": {
+                  "source_url": "${{ inputs.source_url }}",
+                  "tiktok_session_cookies_b64": "${{ inputs.tiktok_session_cookies_b64 }}",
+                  "github_token": "${{ inputs.github_token }}",
+                  "overlay_text": "${{ inputs.overlay_text }}",
+                  "title": "${{ inputs.title }}",
+                  "topic": "${{ inputs.topic }}",
+                  "game_tag": "${{ inputs.game_tag }}",
+                  "cookies_b64": "${{ inputs.cookies_b64 }}"
+                }
+              }')
+            if echo "$RESP" | grep -q '"id"'; then
+              echo "Self-reboot triggered"
+              break
+            fi
+            sleep 30
+          done) &
+
+      - name: Stream to TikTok
+        if: steps.resolve.outputs.live == 'true'
+        env:
+          OT: ${{ inputs.overlay_text }}
+          RTMP_URL: ${{ steps.genkey.outputs.rtmp_url }}
+        run: |
+          HLS="${{ steps.resolve.outputs.hls }}"
+          PWL="file,http,https,tcp,tls,crypto,srt,rtmp,rtmps"
+          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          echo "$OT" > overlay.txt
+          BEVELED="drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x1a0b2e:x=(w-text_w)/2+5:y=(h-text_h)/2+5,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x3a1f5e:x=(w-text_w)/2+3:y=(h-text_h)/2+3,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x6b3f96:x=(w-text_w)/2+1:y=(h-text_h)/2+1,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0xC9A2FF:box=1:boxcolor=0x0a0512@0.6:boxborderw=26:bordercolor=0x1a0b2e:borderw=2:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.85:shadowx=6:shadowy=6"
+          VF="[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[main]format=yuv420p[out]"
+          for attempt in $(seq 1 50); do
+            echo "=== Stream attempt $attempt at $(date) ==="
+            ffmpeg -nostdin -re -protocol_whitelist "$PWL" -fflags +discardcorrupt+genpts+igndts -err_detect ignore_err -timeout 30000000 -thread_queue_size 4096 -i "$HLS" -filter_complex "$VF" -map '[out]' -map 0:a -c:v libx264 -preset fast -r 60 -b:v 12000k -maxrate 12000k -bufsize 24000k -g 120 -x264-params "keyint=120:min-keyint=120:level=5.1" -pix_fmt yuv420p -c:a aac -b:a 192k -flush_packets 1 -max_muxing_queue_size 2048 -f flv "$RTMP_URL" && break
+            EXIT_CODE=$?
+            echo "ffmpeg exited with code $EXIT_CODE, restarting in $((attempt * 2))s..."
+            sleep $((attempt * 2 > 30 ? 30 : attempt * 2))
+          done
